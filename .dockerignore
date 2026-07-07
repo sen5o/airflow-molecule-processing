@@ -1,0 +1,31 @@
+# --- Version control ---
+.git/
+.gitignore
+
+# --- Astro / local dev artifacts (not needed inside the image) ---
+.astro/
+airflow_settings.yaml
+logs/
+
+# --- Secrets (never bake into the image) ---
+.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- OS / editor cruft ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- Docs / misc project files not needed at runtime ---
+README.md
+docker-compose.override.yml

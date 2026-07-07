@@ -1,0 +1,38 @@
+# --- Secrets / local-only config ---
+.env
+airflow_settings.yaml
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Astro / Airflow local runtime artifacts ---
+.astro/
+logs/
+airflow.db
+airflow-webserver.pid
+*.cfg.bak
+
+# --- OS / editor cruft ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- Local/large data (never commit real datasets or generated outputs) ---
+*.csv
+!/sample_data/*.csv
+*.parquet
+*.zip
+*.pkl
+
+# --- ChemProp checkpoints (large binary artifacts, not part of source control) ---
+*.ckpt
+*.pt
