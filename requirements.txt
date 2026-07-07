@@ -1,0 +1,32 @@
+# Runtime dependencies — installed into the Astro Runtime image and used by
+# Airflow tasks. Keep this file minimal: only what the DAG actually imports
+# at execution time. Dev-only tooling (mypy, ruff, test fixtures) lives in
+# requirements-dev.txt instead, so it never bloats the production image.
+
+# --- Airflow provider ---
+# S3Hook, used by include/chem/s3_io.py to read/write CSVs from S3 or MinIO
+# (same code path for both — only the Airflow Connection differs).
+apache-airflow-providers-amazon
+
+# --- Cheminformatics / data science stack ---
+# RDKit: molecule generation (molzip), property/descriptor calculation.
+rdkit
+# scikit-learn: K-means clustering + StandardScaler for molecules_clustering.py.
+scikit-learn
+# pandas: DataFrame handling in graph_generation.py (TMAP/Faerun input format).
+pandas
+# numpy: feature matrix construction in molecules_clustering.py.
+numpy
+
+# --- Optional steps (Step 4 / Step 5) ---
+# tmap and faerun (similarity graph, graph_generation.py) are intentionally
+# NOT listed here: they require a conda environment (see the original
+# graph_generation worker's Dockerfile) and are incompatible with a plain
+# pip-based Astro Runtime image. build_graph() catches ImportError and the
+# corresponding Airflow task skips gracefully if they aren't installed.
+#
+# chemprop (Step 4, chemprop.py) is also not listed here for the same
+# reason: it pulls in a heavy torch/lightning stack that isn't needed
+# unless a trained checkpoint is actually being used. predict_chemprop()
+# skips gracefully via ChemPropNotConfigured when no checkpoint is set.
+# To enable it, add `chemprop` here and set CHEMPROP_CHECKPOINT_PATH in .env.
