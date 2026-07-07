@@ -1,7 +1,8 @@
 # Runtime dependencies — installed into the Astro Runtime image and used by
 # Airflow tasks. Keep this file minimal: only what the DAG actually imports
-# at execution time. Dev-only tooling (mypy, ruff, test fixtures) lives in
-# requirements-dev.txt instead, so it never bloats the production image.
+# at execution time. Local-only tooling (mypy, ruff) is intentionally not
+# listed here — see the "Testing" section in README.md for how to install
+# and run them without bloating the production image.
 
 # --- Airflow provider ---
 # S3Hook, used by include/chem/s3_io.py to read/write CSVs from S3 or MinIO
