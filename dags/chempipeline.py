@@ -1,14 +1,15 @@
 """Cheminformatics pipeline DAG.
 
-Iteration 2: weekly schedule, automatic multi-dataset discovery, and an
-`overwrite` param.
+Iteration 3: data quality gates between processing steps, and MS Teams
+notifications (failure alerts + a weekly run summary) for scientists.
 
 Flow:
-    discover_datasets -> [process_dataset (mapped, one per discovered id)]
+    discover_datasets -> [process_dataset (mapped, one per discovered id)] -> notify_summary
                               |
-                              +-- check_inputs -> generate -> calculate_properties -> cluster
-                                                                                        |-> build_graph        (optional)
-                                                                                        +-> predict_chemprop   (optional)
+                              +-- check_inputs -> validate_inputs -> generate -> validate_generation
+                                      -> calculate_properties -> cluster -> validate_clustering
+                                                                              |-> build_graph        (optional)
+                                                                              +-> predict_chemprop   (optional)
 
 Scientists drop two files per dataset into S3:
     <dataset_id>_scaffolds.csv   (column: smiles - scaffolds with [*:n] points)
@@ -17,8 +18,15 @@ Scientists drop two files per dataset into S3:
 "New" is defined by output existence, not by file modification time: a
 dataset is (re)processed if `processed/<dataset_id>/clusters.csv` does not
 yet exist in the bucket, or if `overwrite=True` is passed at trigger time.
-This is robust to manual re-runs, missed schedule windows, and backfills
-without depending on `data_interval`/catchup semantics.
+
+The `validate_*` tasks are data quality gates (include/chem/quality_checks.py):
+each one is a pass-through (returns its input unchanged) so downstream tasks
+have an explicit XCom dependency on it completing successfully first -- a
+failed check stops that dataset's pipeline the same way any other task
+failure would. Any task failure (DQ or otherwise) triggers a Teams
+notification via on_failure_callback (include/chem/notifications.py);
+notify_summary posts a run-level summary regardless of per-dataset outcome.
+Both are no-ops if MS_TEAMS_WEBHOOK_URL isn't configured.
 
 Intermediate artifacts are written back to S3 under processed/<dataset_id>/.
 State is tracked by Airflow (task statuses); no database is used. All chemistry
@@ -41,7 +49,9 @@ from include.chem import (
     graph_generation,
     molecules_clustering,
     molecules_generation,
+    notifications,
     properties_calculation,
+    quality_checks,
     s3_io,
 )
 
@@ -57,6 +67,11 @@ FINGERPRINT = "ECFP4"
 SCAFFOLDS_SUFFIX = "_scaffolds.csv"
 R_GROUPS_SUFFIX = "_r_groups.csv"
 
+# Data quality thresholds
+MIN_SMILES_VALID_RATIO = 0.8
+MIN_MOLECULE_COUNT = 1
+MAX_DOMINANT_CLUSTER_RATIO = 0.9
+
 
 def _output_key(dataset_id: str, name: str) -> str:
     return f"processed/{dataset_id}/{name}"
@@ -70,10 +85,24 @@ def _extract_smiles(row: dict[str, Any]) -> str:
     return ""
 
 
+def _notify_task_failure(context: dict[str, Any]) -> None:
+    """on_failure_callback: posts a Teams alert for any failed task (incl. DQ gates)."""
+    ti = context.get("task_instance") or context.get("ti")
+    dag_obj = context.get("dag")
+    notifications.notify_failure(
+        dag_id=getattr(dag_obj, "dag_id", "chempipeline"),
+        task_id=getattr(ti, "task_id", "unknown"),
+        run_id=str(context.get("run_id", "unknown")),
+        error=str(context.get("exception", "")),
+        log_url=getattr(ti, "log_url", None),
+    )
+
+
 DEFAULT_ARGS = {
     "owner": "cheminformatics-pipeline",
     "retries": 1,
     "retry_delay": pendulum.duration(minutes=2),
+    "on_failure_callback": _notify_task_failure,
 }
 
 
@@ -186,6 +215,25 @@ def chempipeline() -> None:
         return cfg
 
     @task
+    def validate_inputs(cfg: dict[str, Any]) -> dict[str, Any]:
+        """DQ gate: SMILES validity ratio + at least one usable scaffold."""
+        scaffold_rows = s3_io.read_rows(cfg["bucket"], cfg["scaffolds_key"], AWS_CONN_ID)
+        r_group_rows = s3_io.read_rows(cfg["bucket"], cfg["r_groups_key"], AWS_CONN_ID)
+
+        scaffold_smiles = [{"smiles": _extract_smiles(row)} for row in scaffold_rows]
+        quality_checks.validate_smiles_ratio(scaffold_smiles, min_ratio=MIN_SMILES_VALID_RATIO)
+
+        r_group_columns = list(r_group_rows[0].keys()) if r_group_rows else []
+        r_group_smiles = [
+            {"smiles": value} for row in r_group_rows for value in row.values()
+        ]
+        quality_checks.validate_smiles_ratio(r_group_smiles, min_ratio=MIN_SMILES_VALID_RATIO)
+        quality_checks.check_scaffold_attachment_points(scaffold_smiles, len(r_group_columns))
+
+        log.info("Input data quality checks passed for dataset '%s'.", cfg["dataset_id"])
+        return cfg
+
+    @task
     def generate(cfg: dict[str, Any]) -> str:
         scaffold_rows = s3_io.read_rows(cfg["bucket"], cfg["scaffolds_key"], AWS_CONN_ID)
         r_groups = molecules_generation.load_r_groups(
@@ -218,6 +266,13 @@ def chempipeline() -> None:
         return out_key
 
     @task
+    def validate_generation(molecules_key: str, cfg: dict[str, Any]) -> str:
+        """DQ gate: at least MIN_MOLECULE_COUNT molecule(s) were generated."""
+        rows = s3_io.read_rows(cfg["bucket"], molecules_key, AWS_CONN_ID)
+        quality_checks.check_min_molecule_count(len(rows), minimum=MIN_MOLECULE_COUNT)
+        return molecules_key
+
+    @task
     def calculate_properties(molecules_key: str, cfg: dict[str, Any]) -> str:
         rows = s3_io.read_rows(cfg["bucket"], molecules_key, AWS_CONN_ID)
         enriched, _stats = properties_calculation.calculate_properties(rows)
@@ -232,6 +287,17 @@ def chempipeline() -> None:
         out_key = _output_key(cfg["dataset_id"], "clusters.csv")
         s3_io.write_rows(clustered, cfg["bucket"], out_key, AWS_CONN_ID)
         return out_key
+
+    @task
+    def validate_clustering(clusters_key: str, cfg: dict[str, Any]) -> str:
+        """DQ gate: no single cluster dominates (clustering is meaningful)."""
+        rows = s3_io.read_rows(cfg["bucket"], clusters_key, AWS_CONN_ID)
+        cluster_sizes: dict[int, int] = {}
+        for row in rows:
+            cluster_id = int(row.get("cluster", -1))
+            cluster_sizes[cluster_id] = cluster_sizes.get(cluster_id, 0) + 1
+        quality_checks.check_cluster_balance(cluster_sizes, max_dominant_ratio=MAX_DOMINANT_CLUSTER_RATIO)
+        return clusters_key
 
     @task
     def build_graph(clusters_key: str, cfg: dict[str, Any]) -> str:
@@ -263,24 +329,40 @@ def chempipeline() -> None:
         s3_io.write_rows(predicted, cfg["bucket"], out_key, AWS_CONN_ID)
         return out_key
 
-    # NOTE: mypy flags these as "XComArg" vs the annotated dict/str types below.
-    # This is a known, long-standing Airflow/mypy limitation (apache/airflow#39514):
-    # calling a @task function at DAG-authoring time returns an XComArg proxy for
-    # the future value, not the literal annotated return type, and there is no
-    # first-party mypy plugin that resolves this. Ignored deliberately, not a bug.
+    @task(trigger_rule="all_done")
+    def notify_summary(dataset_ids: list[str]) -> None:
+        """Posts a Teams run summary regardless of per-dataset success/failure
+        (trigger_rule=all_done), so scientists always hear about a weekly run."""
+        context = get_current_context()
+        notifications.notify_run_summary(
+            dag_id="chempipeline",
+            run_id=str(context.get("run_id", "unknown")),
+            processed_datasets=dataset_ids,
+        )
+
+    # NOTE: mypy flags these as "XComArg" vs the annotated dict/str/list types
+    # below. This is a known, long-standing Airflow/mypy limitation
+    # (apache/airflow#39514): calling a @task function at DAG-authoring time
+    # returns an XComArg proxy for the future value, not the literal annotated
+    # return type, and there is no first-party mypy plugin that resolves this.
+    # Ignored deliberately, not a bug.
     @task_group(group_id="process_dataset")
     def process_dataset(dataset_id: str) -> None:
         cfg = check_inputs(build_config(dataset_id))  # type: ignore[arg-type]
+        cfg = validate_inputs(cfg)  # type: ignore[arg-type]
         molecules_key = generate(cfg)  # type: ignore[arg-type]
+        molecules_key = validate_generation(molecules_key, cfg)  # type: ignore[arg-type]
         properties_key = calculate_properties(molecules_key, cfg)  # type: ignore[arg-type]
         clusters_key = cluster(properties_key, cfg)  # type: ignore[arg-type]
+        clusters_key = validate_clustering(clusters_key, cfg)  # type: ignore[arg-type]
 
-        # optional branches off the clustered result
+        # optional branches off the validated, clustered result
         build_graph(clusters_key, cfg)  # type: ignore[arg-type]
         predict_chemprop(clusters_key, cfg)  # type: ignore[arg-type]
 
     dataset_ids = discover_datasets()
-    process_dataset.expand(dataset_id=dataset_ids)
+    processed = process_dataset.expand(dataset_id=dataset_ids)
+    processed >> notify_summary(dataset_ids)  # type: ignore[arg-type]
 
 
 chempipeline()
