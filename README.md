@@ -130,14 +130,27 @@ Docker:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt mypy
+pip install -r requirements.txt mypy ruff
+
 mypy dags include/chem --config-file mypy.ini
+ruff check dags include --config ruff.toml
 ```
 
-`mypy.ini` deliberately silences known third-party stub gaps in RDKit
-(some `rdkit-stubs` releases ship broken or incomplete `.pyi` files for
-functions that work fine at runtime) — see inline comments in the affected
-modules for specifics.
+**Known gotcha:** `rdkit`'s bundled type stubs are broken in some releases
+(as of writing, `2026.3.3` ships a `Chem/rdchem.pyi` with an invalid
+parameter ordering, which fails mypy with a syntax error before any real
+type-checking happens — unrelated to this project's code, and it does not
+affect runtime behavior). If `mypy` fails with a `[syntax]` error pointing
+into `rdkit-stubs`, downgrade rdkit for your local venv only:
+
+```bash
+pip install "rdkit==2025.9.6"
+```
+
+`mypy.ini` / `ruff.toml` deliberately silence a few other known third-party
+stub gaps (RDKit functions that exist and work fine at runtime but aren't
+declared in its stubs) — see inline comments in the affected modules for
+specifics.
 
 ## Branching policy
 
